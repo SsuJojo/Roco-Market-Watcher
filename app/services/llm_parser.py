@@ -3,6 +3,7 @@ import logging
 import re
 from datetime import datetime
 from html import unescape
+from typing import Any
 
 from openai import APIError, OpenAI
 
@@ -22,8 +23,10 @@ def _log_json(title: str, payload) -> None:
 
 TIME_ORDER = {"全天": 0, "8-12": 1, "12-16": 2, "16-20": 3, "20-24": 4}
 ALLOWED_MERGE_FIELDS = {"name", "quantity", "price", "desc", "raw", "status", "source_url"}
+POSTPROCESS_ROW_FIELDS = {"date", "time", "name", "quantity", "price", "status", "desc", "raw"}
 VALID_ITEM_STATUS = {"active", "empty", "pending"}
 VALID_SLOT_STATUS = {"active", "empty", "pending"}
+DEFAULT_POSTPROCESS_PROMPT = "根据 merged 结果生成 CSV 行数据"
 
 
 class LLMParseError(RuntimeError):
@@ -535,6 +538,67 @@ def _coerce_str(value) -> str:
     return str(value).strip()
 
 
+def _normalize_date(value: Any) -> str:
+    text = _coerce_str(value)
+    if not text:
+        return datetime.now().strftime("%Y-%m-%d")
+    match = re.search(r"(20\d{2})[-/](\d{1,2})[-/](\d{1,2})", text)
+    if match:
+        year, month, day = match.groups()
+        return f"{int(year):04d}-{int(month):02d}-{int(day):02d}"
+    return datetime.now().strftime("%Y-%m-%d")
+
+
+def _normalize_time_slot(value: Any, fallback: str = "") -> str:
+    text = _coerce_str(value)
+    normalized = text.replace("：", ":").replace("－", "-").replace("—", "-")
+    if normalized in TIME_ORDER:
+        return normalized
+    if re.fullmatch(r"\d{1,2}\s*-\s*\d{1,2}", normalized):
+        start, end = [part.strip() for part in normalized.split("-")]
+        candidate = f"{int(start)}-{int(end)}"
+        if candidate in TIME_ORDER:
+            return candidate
+    if fallback and fallback in TIME_ORDER:
+        return fallback
+    return ""
+
+
+def _normalize_postprocess_status(value: Any, row_time: str, current_time: str | None) -> str:
+    status = _coerce_str(value).lower()
+    if row_time and current_time and row_time == current_time:
+        return "active"
+    if status in VALID_ITEM_STATUS:
+        return status
+    return "pending"
+
+
+def _normalize_postprocess_row(row: Any, merged: dict) -> dict | None:
+    if not isinstance(row, dict):
+        return None
+
+    current_time = merged.get("current_time")
+    published_at = _normalize_date(merged.get("published_at"))
+    row_time = _normalize_time_slot(row.get("time"), fallback=current_time or "")
+    name = _coerce_str(row.get("name"))
+    if not name:
+        return None
+
+    normalized = {
+        "date": _normalize_date(row.get("date") or published_at),
+        "time": row_time,
+        "name": name,
+        "quantity": _coerce_int(row.get("quantity")),
+        "price": _coerce_int(row.get("price")),
+        "status": _normalize_postprocess_status(row.get("status"), row_time, current_time),
+        "desc": _coerce_str(row.get("desc")),
+        "raw": _coerce_str(row.get("raw")),
+    }
+    if not normalized["time"]:
+        return None
+    return normalized
+
+
 def _normalize_item(item: dict, source_url: str) -> dict | None:
     if not isinstance(item, dict):
         return None
@@ -611,7 +675,7 @@ def _build_parse_prompt(clean_text: str, source_url: str, listen: list[str]) -> 
             "如果正文里没有足够信息，返回空 slots。",
             "时间字段优先使用这些值：全天、8-12、12-16、16-20、20-24。",
             "每个 item 输出字段：name, quantity, price, desc, raw, status。",
-            "quantity/price 无法确认时填 null。status 只能是 active、empty、pending 之一。",
+            "quantity/price 无法确认时填 null。status 只能是 active、missed 之一。",
             "输出 JSON 结构示例:",
             '{"title": "", "published_at": "", "slots": [{"id": "", "label": "", "time": "", "items": [{"name": "", "quantity": null, "price": null, "desc": "", "raw": "", "status": "active"}], "notes": [], "status": "active"}]}',
             f"当前监听关键词仅供参考，不要求你生成 matches: {listen_json}",
@@ -622,7 +686,7 @@ def _build_parse_prompt(clean_text: str, source_url: str, listen: list[str]) -> 
     )
 
 
-def _call_parse_llm(clean_text: str, llm_config: dict | None, source_url: str, listen: list[str]) -> tuple[dict, str]:
+def _call_json_llm(messages: list[dict], llm_config: dict | None, log_context: str, error_prefix: str) -> tuple[dict, str]:
     config = llm_config or {}
     _require_llm_config(config)
     client = _openai_client(config)
@@ -630,11 +694,6 @@ def _call_parse_llm(clean_text: str, llm_config: dict | None, source_url: str, l
     models = _iter_models(config)
     if not models:
         raise LLMParseError("llm.model is required for parsing")
-
-    messages = [
-        {"role": "system", "content": "你是一个严格输出 JSON 的网页正文结构化解析器。"},
-        {"role": "user", "content": _build_parse_prompt(clean_text, source_url, listen)},
-    ]
 
     last_error = None
     for candidate in models:
@@ -660,7 +719,7 @@ def _call_parse_llm(clean_text: str, llm_config: dict | None, source_url: str, l
                 logger.warning("LLM model unavailable, trying fallback model=%s error=%s", candidate, message)
                 last_error = LLMParseError(f"LLM model unavailable: {candidate}")
                 continue
-            last_error = LLMParseError(f"LLM request failed: {exc}")
+            last_error = LLMParseError(f"{error_prefix}: {exc}")
             break
         except (AttributeError, IndexError, TypeError, ValueError) as exc:
             last_error = LLMParseError(f"Unexpected LLM response shape: {exc}")
@@ -670,10 +729,76 @@ def _call_parse_llm(clean_text: str, llm_config: dict | None, source_url: str, l
             last_error = LLMParseError("LLM returned empty content")
             break
 
-        logger.info(_format_block("LLM 原始输出", f"来源: {source_url}\n{content}"))
+        logger.info(_format_block("LLM 原始输出", f"来源: {log_context}\n{content}"))
         return _parse_json_object(content), content
 
-    raise last_error or LLMParseError("LLM request failed")
+    raise last_error or LLMParseError(error_prefix)
+
+
+def _call_parse_llm(clean_text: str, llm_config: dict | None, source_url: str, listen: list[str]) -> tuple[dict, str]:
+    messages = [
+        {"role": "system", "content": "你是一个严格输出 JSON 的网页正文结构化解析器。"},
+        {"role": "user", "content": _build_parse_prompt(clean_text, source_url, listen)},
+    ]
+    return _call_json_llm(messages, llm_config, source_url, "LLM request failed")
+
+
+def _build_postprocess_prompt(merged: dict, listen: list[str]) -> str:
+    listen_json = json.dumps([name for name in listen if name], ensure_ascii=False)
+    merged_json = json.dumps(_strip_comments(merged), ensure_ascii=False, indent=2)
+    return "\n".join(
+        [
+            "你会收到 scan 接口 merged 字段的 JSON。",
+            "请把它转换成结构化 JSON 行数据，严格输出 JSON object，不要 Markdown、不要解释、不要代码块。",
+            "输出格式固定为: {'rows': [{'date': 'YYYY-MM-DD', 'time': '8-12|12-16|16-20|20-24|全天', 'name': str, 'quantity': int|null, 'price': int|null, 'status': 'active|pending|empty', 'desc': str, 'raw': str}]}。",
+            "约束:",
+            "1. date 不可为空，优先使用 merged.published_at；没有就用今天日期。",
+            "2. time 必须是时间段，只能使用：全天、8-12、12-16、16-20、20-24。",
+            "3. name 不可为空。",
+            "4. quantity/price 获取不到时填 null。",
+            "5. desc 是你基于视频标题/字幕/上下文整理出的描述。",
+            "6. raw 是该行依赖的原始文本，尽量保留来源标题或原句。",
+            "7. 同一个 date + time + name 只保留一条最合理结果。",
+            f"当前监听关键词: {listen_json}",
+            "merged JSON:",
+            merged_json,
+        ]
+    )
+
+
+def _normalize_postprocess_result(result: dict, merged: dict) -> dict:
+    raw_rows = result.get("rows", [])
+    if raw_rows is None:
+        raw_rows = []
+    if not isinstance(raw_rows, list):
+        raise LLMParseError("LLM response field 'rows' must be a list")
+
+    rows = []
+    seen: set[tuple[str, str, str]] = set()
+    for raw_row in raw_rows:
+        row = _normalize_postprocess_row(raw_row, merged)
+        if not row:
+            continue
+        key = (row["date"], row["time"], _normalize_merge_name(row["name"]))
+        if key in seen:
+            continue
+        seen.add(key)
+        rows.append(row)
+
+    rows.sort(key=lambda row: (row["date"], TIME_ORDER.get(row["time"], 99), row["name"]))
+    return {"rows": rows}
+
+
+def post_process_scan_result(merged: dict, llm_config: dict | None, listen: list[str]) -> dict:
+    messages = [
+        {"role": "system", "content": "你是一个严格输出 JSON 的 CSV 行整理器。"},
+        {"role": "user", "content": _build_postprocess_prompt(merged, listen)},
+    ]
+    llm_result, llm_raw_content = _call_json_llm(messages, llm_config, merged.get("source_url") or "merged", "LLM post-process failed")
+    _log_json("LLM 二次处理后的 JSON", {"result": llm_result})
+    postprocessed = _normalize_postprocess_result(llm_result, merged)
+    postprocessed["llm_raw_content"] = llm_raw_content
+    return postprocessed
 
 
 def _normalize_llm_result(result: dict, normalized_text: str, source_length: int, source_url: str, listen: list[str]) -> dict:

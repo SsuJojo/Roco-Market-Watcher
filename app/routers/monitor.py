@@ -6,9 +6,9 @@ from fastapi import APIRouter, HTTPException, Request, Response
 
 from app.services.bili_fetcher import extract_uid, fetch_bili_video_titles
 from app.services.fetcher import fetch_html
-from app.services.llm_parser import LLMParseError, _strip_comments, merge_parsed_sources, parse_article_content, render_markdown
+from app.services.llm_parser import LLMParseError, _strip_comments, merge_parsed_sources, parse_article_content, post_process_scan_result, render_markdown
 from app.services.notifier import send_openclaw_message
-from app.services.persistence import load_cached_scan, persist_scan
+from app.services.persistence import load_cached_scan, persist_postprocessed_scan
 from app.services.rules import should_notify
 
 logger = logging.getLogger(__name__)
@@ -110,13 +110,15 @@ def _scan_once() -> dict:
         return videos
 
     merged = merge_parsed_sources(results, listen, llm_config)
+    postprocessed = post_process_scan_result(merged, llm_config, listen)
     triggered = should_notify(merged, listen)
-    csv_path = persist_scan(merged)
+    csv_path = persist_postprocessed_scan(postprocessed)
 
     return _strip_comments(
         {
             "sources": results,
             "merged": merged,
+            "postprocessed": postprocessed,
             "triggered": triggered,
             "csv_paths": [csv_path],
         }
