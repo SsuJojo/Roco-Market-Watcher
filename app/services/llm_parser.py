@@ -185,9 +185,47 @@ def _require_llm_config(llm_config: dict | None) -> tuple[str, str]:
     model = (config.get("model") or "").strip()
     if not base_url:
         raise LLMParseError("llm.base_url is required for parsing")
-    if not model:
+    if not model and not _get_model_candidates(config):
         raise LLMParseError("llm.model is required for parsing")
     return base_url, model
+
+
+def _get_model_candidates(config: dict) -> list[str]:
+    candidates = config.get("models") or config.get("model_candidates") or []
+    if isinstance(candidates, list):
+        return [str(item).strip() for item in candidates if str(item).strip()]
+    return []
+
+
+def _iter_models(config: dict) -> list[str]:
+    primary = (config.get("model") or "").strip()
+    candidates = _get_model_candidates(config)
+    models = [primary] if primary else []
+    for candidate in candidates:
+        if candidate not in models:
+            models.append(candidate)
+    return models
+
+
+def _extract_error_message(response: requests.Response) -> str:
+    try:
+        data = response.json()
+    except ValueError:
+        return response.text
+    if isinstance(data, dict):
+        error = data.get("error")
+        if isinstance(error, dict):
+            return str(error.get("message") or error.get("detail") or error)
+        if "message" in data:
+            return str(data.get("message"))
+    return str(data)
+
+
+def _is_model_unavailable(response: requests.Response) -> bool:
+    if response.status_code not in (400, 404, 422):
+        return False
+    message = _extract_error_message(response).lower()
+    return "model" in message and any(token in message for token in ("not found", "does not exist", "unsupported", "invalid"))
 
 
 def _build_merge_prompt(slot: dict, candidates: list[dict]) -> str:
@@ -230,12 +268,10 @@ def _build_merge_prompt(slot: dict, candidates: list[dict]) -> str:
 
 def _call_merge_llm(slot: dict, candidates: list[dict], llm_config: dict) -> dict | None:
     base_url = (llm_config.get("base_url") or "").rstrip("/")
-    model = (llm_config.get("model") or "").strip()
-    if not base_url or not model:
+    if not base_url:
         return None
 
     payload = {
-        "model": model,
         "messages": [
             {"role": "system", "content": "你是一个严格输出 JSON 的数据合并器。"},
             {"role": "user", "content": _build_merge_prompt(slot, candidates)},
@@ -244,18 +280,35 @@ def _call_merge_llm(slot: dict, candidates: list[dict], llm_config: dict) -> dic
         "temperature": 0,
     }
 
-    response = requests.post(
-        f"{base_url}/chat/completions",
-        headers=_llm_headers(llm_config),
-        json=payload,
-        timeout=30,
-    )
-    response.raise_for_status()
-    data = response.json()
-    content = data["choices"][0]["message"]["content"]
-    if not content:
+    models = _iter_models(llm_config)
+    if not models:
         return None
-    return json.loads(content)
+
+    for candidate in models:
+        payload["model"] = candidate
+        response = requests.post(
+            f"{base_url}/chat/completions",
+            headers=_llm_headers(llm_config),
+            json=payload,
+            timeout=30,
+        )
+        if response.status_code >= 400:
+            if _is_model_unavailable(response):
+                logger.warning(
+                    "Merge LLM model unavailable, trying fallback model=%s status=%s error=%s",
+                    candidate,
+                    response.status_code,
+                    _extract_error_message(response),
+                )
+                continue
+            response.raise_for_status()
+        data = response.json()
+        content = data["choices"][0]["message"]["content"]
+        if not content:
+            return None
+        return json.loads(content)
+
+    return None
 
 
 def merge_parsed_sources(sources: list[dict], listen: list[str], llm_config: dict | None = None) -> dict:
@@ -608,7 +661,6 @@ def _call_parse_llm(clean_text: str, llm_config: dict | None, source_url: str, l
     config = llm_config or {}
     base_url, model = _require_llm_config(config)
     payload = {
-        "model": model,
         "messages": [
             {"role": "system", "content": "你是一个严格输出 JSON 的网页正文结构化解析器。"},
             {"role": "user", "content": _build_parse_prompt(clean_text, source_url, listen)},
@@ -616,28 +668,52 @@ def _call_parse_llm(clean_text: str, llm_config: dict | None, source_url: str, l
         "response_format": {"type": "json_object"},
         "temperature": 0,
     }
-    _log_json("LLM 请求 payload", payload)
 
-    try:
-        response = requests.post(
-            f"{base_url}/chat/completions",
-            headers=_llm_headers(config),
-            json=payload,
-            timeout=60,
-        )
-        response.raise_for_status()
-        data = response.json()
-        content = data["choices"][0]["message"]["content"]
-    except requests.RequestException as exc:
-        raise LLMParseError(f"LLM request failed: {exc}") from exc
-    except (KeyError, IndexError, TypeError, ValueError) as exc:
-        raise LLMParseError(f"Unexpected LLM response shape: {exc}") from exc
+    models = _iter_models(config)
+    if not models:
+        raise LLMParseError("llm.model is required for parsing")
 
-    if not content:
-        raise LLMParseError("LLM returned empty content")
+    last_error = None
+    for candidate in models:
+        payload["model"] = candidate
+        _log_json("LLM 请求 payload", payload)
+        try:
+            response = requests.post(
+                f"{base_url}/chat/completions",
+                headers=_llm_headers(config),
+                json=payload,
+                timeout=60,
+            )
+            if response.status_code >= 400:
+                if _is_model_unavailable(response):
+                    logger.warning(
+                        "LLM model unavailable, trying fallback model=%s status=%s error=%s",
+                        candidate,
+                        response.status_code,
+                        _extract_error_message(response),
+                    )
+                    last_error = LLMParseError(
+                        f"LLM model unavailable: {candidate} (status {response.status_code})"
+                    )
+                    continue
+                response.raise_for_status()
+            data = response.json()
+            content = data["choices"][0]["message"]["content"]
+        except requests.RequestException as exc:
+            last_error = LLMParseError(f"LLM request failed: {exc}")
+            break
+        except (KeyError, IndexError, TypeError, ValueError) as exc:
+            last_error = LLMParseError(f"Unexpected LLM response shape: {exc}")
+            break
 
-    logger.info(_format_block("LLM 原始输出", f"来源: {source_url}\n{content}"))
-    return _parse_json_object(content), content
+        if not content:
+            last_error = LLMParseError("LLM returned empty content")
+            break
+
+        logger.info(_format_block("LLM 原始输出", f"来源: {source_url}\n{content}"))
+        return _parse_json_object(content), content
+
+    raise last_error or LLMParseError("LLM request failed")
 
 
 def _normalize_llm_result(result: dict, normalized_text: str, source_length: int, source_url: str, listen: list[str]) -> dict:

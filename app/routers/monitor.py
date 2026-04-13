@@ -67,20 +67,31 @@ def _scan_once() -> dict:
         url = source["url"]
         uid = extract_uid(url)
         if uid:
-            titles = fetch_bili_video_titles(uid)
+            bili_payload = fetch_bili_video_titles(uid)
+            titles = bili_payload.get("titles", [])
             if not titles:
-                logger.warning(f"No video titles found for UID {uid}, skipping.")
+                logger.warning(
+                    "No same-day Bilibili titles found for uid=%s method=%s error=%s",
+                    uid,
+                    bili_payload.get("method"),
+                    bili_payload.get("error"),
+                )
                 continue
-                
-            # Use video titles as the input "content"
+
+            logger.info(
+                "Using Bilibili source uid=%s method=%s day=%s count=%s",
+                uid,
+                bili_payload.get("method"),
+                bili_payload.get("day"),
+                len(titles),
+            )
             content = "\n".join(titles)
-            # Wrap in simple HTML to reuse parse_article_content's cleaning logic
             html = f"<html><body><div class='bili-videos'>{content}</div></body></html>"
             parse_config = {"article_class": "bili-videos"}
         else:
             html = fetch_html(url, fetch_config.get("headers"))
             parse_config = {"article_class": source.get("class")}
-            
+
         parsed = parse_article_content(html, parse_config, listen, llm_config, url)
         results.append(parsed)
 

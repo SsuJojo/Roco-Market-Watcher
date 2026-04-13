@@ -44,25 +44,4 @@ def fetch_html(url: str, headers: dict[str, str] | None = None) -> str:
     return resp.text
 
 
-    if not headers:
-        return None
-    return {
-        str(key): str(value)
-        for key, value in headers.items()
-        if key and not str(key).startswith("_") and value is not None
-    }
-
-
-def fetch_html(url: str, headers: dict[str, str] | None = None) -> str:
-    normalized_headers = _normalize_headers(headers)
-    logger.info(
-        "Fetching source URL=%s headers=%s",
-        url,
-        json.dumps(normalized_headers, ensure_ascii=False, indent=2) if normalized_headers else "null",
-    )
-    resp = requests.get(url, headers=normalized_headers, timeout=20)
-    resp.raise_for_status()
-    resp.encoding = resp.apparent_encoding or resp.encoding
-    logger.info("Fetched response status=%s encoding=%s url=%s", resp.status_code, resp.encoding, url)
-    logger.info("Fetched raw HTML from %s:\n%s", url, resp.text)
-    return resp.text
+__all__ = ["fetch_html"]
