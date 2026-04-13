@@ -1,15 +1,19 @@
 import json
 from pathlib import Path
-from fastapi import APIRouter, Response
+
+from fastapi import APIRouter, HTTPException, Response
+
 from app.services.fetcher import fetch_html
-from app.services.llm_parser import merge_parsed_sources, parse_article_content, render_markdown
-from app.services.rules import should_notify
+from app.services.llm_parser import LLMParseError, merge_parsed_sources, parse_article_content, render_markdown
 from app.services.notifier import send_openclaw_message
 from app.services.persistence import persist_scan
+from app.services.rules import should_notify
 
 router = APIRouter(tags=["monitor"])
 ROOT = Path(__file__).resolve().parents[2]
 CONFIG = json.loads((ROOT / "config.json").read_text(encoding="utf-8"))
+
+
 def _scan_once() -> dict:
     fetch_config = CONFIG.get("fetch", {})
     sources = fetch_config.get("sources") or []
@@ -17,16 +21,16 @@ def _scan_once() -> dict:
         sources = [{"url": fetch_config["url"], "class": fetch_config.get("class")}]
 
     listen = CONFIG.get("listen", [])
+    llm_config = CONFIG.get("llm", {})
 
     results = []
     for source in sources:
         html = fetch_html(source["url"], fetch_config.get("headers"))
         parse_config = {"article_class": source.get("class")}
-        parsed = parse_article_content(html, parse_config, listen)
-        parsed["source_url"] = source["url"]
+        parsed = parse_article_content(html, parse_config, listen, llm_config, source["url"])
         results.append(parsed)
 
-    merged = merge_parsed_sources(results, listen, CONFIG.get("llm", {}))
+    merged = merge_parsed_sources(results, listen, llm_config)
     triggered = should_notify(merged, listen)
     csv_path = persist_scan(merged)
 
@@ -38,9 +42,18 @@ def _scan_once() -> dict:
     }
 
 
+def _scan_or_raise() -> dict:
+    try:
+        return _scan_once()
+    except LLMParseError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
 @router.post("/scan")
 def scan():
-    result = _scan_once()
+    result = _scan_or_raise()
     if result["triggered"] and CONFIG.get("notify", {}).get("enabled"):
         message = render_markdown(result["merged"])
         send_openclaw_message(CONFIG["notify"]["command"], message)
@@ -49,11 +62,11 @@ def scan():
 
 @router.get("/json")
 def scan_json():
-    return _scan_once()
+    return _scan_or_raise()
 
 
 @router.get("/md")
 def scan_markdown():
-    result = _scan_once()
+    result = _scan_or_raise()
     markdown = render_markdown(result["merged"])
     return Response(markdown, media_type="text/markdown; charset=utf-8")
