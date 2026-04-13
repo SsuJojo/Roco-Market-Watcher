@@ -4,6 +4,7 @@ from pathlib import Path
 
 from fastapi import APIRouter, HTTPException, Request, Response
 
+from app.services.bili_fetcher import extract_uid, fetch_bili_video_titles
 from app.services.fetcher import fetch_html
 from app.services.llm_parser import LLMParseError, _strip_comments, merge_parsed_sources, parse_article_content, render_markdown
 from app.services.notifier import send_openclaw_message
@@ -63,9 +64,22 @@ def _scan_once() -> dict:
 
     results = []
     for source in sources:
-        html = fetch_html(source["url"], fetch_config.get("headers"))
-        parse_config = {"article_class": source.get("class")}
-        parsed = parse_article_content(html, parse_config, listen, llm_config, source["url"])
+        url = source["url"]
+        uid = extract_uid(url)
+        if uid:
+            titles = fetch_bili_video_titles(uid)
+            # Use video titles as the input "content"
+            content = "\n".join(titles)
+            # Wrap in simple HTML to reuse parse_article_content's cleaning logic if needed,
+            # or just pass it as is if parse_article_content can handle non-HTML.
+            # Actually, parse_article_content expects HTML, so we wrap it.
+            html = f"<html><body><div class='bili-videos'>{content}</div></body></html>"
+            parse_config = {"article_class": "bili-videos"}
+        else:
+            html = fetch_html(url, fetch_config.get("headers"))
+            parse_config = {"article_class": source.get("class")}
+            
+        parsed = parse_article_content(html, parse_config, listen, llm_config, url)
         results.append(parsed)
 
     merged = merge_parsed_sources(results, listen, llm_config)
