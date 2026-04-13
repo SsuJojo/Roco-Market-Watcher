@@ -6,40 +6,19 @@ from html import unescape
 import requests
 
 
+SECTION_PATTERNS = [
+    (r"全天售卖|全天销售商品", "all_day", "全天售卖", "全天"),
+    (r"8\s*(?:am)?\s*[-—–~到至]\s*12\s*(?:pm)?|8-12", "8-12", "8-12限时", "8-12"),
+    (r"12\s*(?:pm)?\s*[-—–~到至]\s*16|12-16", "12-16", "12-16限时", "12-16"),
+    (r"16\s*[-—–~到至]\s*20|16-20", "16-20", "16-20限时", "16-20"),
+    (r"20\s*[-—–~到至]\s*24|20-24", "20-24", "20-24限时", "20-24"),
+]
 TIME_ORDER = {"全天": 0, "8-12": 1, "12-16": 2, "16-20": 3, "20-24": 4}
-ALLOWED_MERGE_FIELDS = {"name", "quantity", "price", "desc", "raw", "status", "source_url"}
-VALID_ITEM_STATUS = {"active", "empty", "pending"}
-VALID_SLOT_STATUS = {"active", "empty", "pending"}
-
-
-class LLMParseError(RuntimeError):
-    pass
+DESC_TOKENS = ["推荐买", "使用途径", "捕捉", "培养材料", "合成", "获取方式", "随意", "血脉"]
 
 
 def _normalize_merge_name(value: str) -> str:
     return re.sub(r"\s+", "", value or "").strip().lower()
-
-
-def _normalize_merge_text(value) -> str:
-    if value is None:
-        return ""
-    if isinstance(value, str):
-        return value.strip()
-    return str(value).strip()
-
-
-def _normalize_merge_int(value) -> int | None:
-    if value in (None, ""):
-        return None
-    if isinstance(value, bool):
-        return None
-    if isinstance(value, int):
-        return value
-    if isinstance(value, float) and value.is_integer():
-        return int(value)
-    if isinstance(value, str) and re.fullmatch(r"\d+", value.strip()):
-        return int(value.strip())
-    return None
 
 
 def _item_score(item: dict) -> tuple:
@@ -50,7 +29,7 @@ def _item_score(item: dict) -> tuple:
     )
 
 
-def _fallback_merge_item(candidates: list[dict], merge_strategy: str = "fallback") -> dict:
+def _fallback_merge_item(candidates: list[dict]) -> dict:
     merged = {}
     source_urls: list[str] = []
 
@@ -69,92 +48,12 @@ def _fallback_merge_item(candidates: list[dict], merge_strategy: str = "fallback
     best_price = next((candidate.get("price") for candidate in candidates if candidate.get("price") not in (None, "")), None)
 
     result = dict(merged)
-    result["name"] = _normalize_merge_text(result.get("name"))
-    result["quantity"] = _normalize_merge_int(result.get("quantity"))
-    result["price"] = best_price if best_price is not None else _normalize_merge_int(result.get("price"))
-    result["desc"] = _normalize_merge_text(best_desc or result.get("desc", ""))
-    result["raw"] = _normalize_merge_text(best_raw or result.get("raw", ""))
-    result["status"] = "active"
+    result["price"] = best_price if best_price is not None else result.get("price")
+    result["desc"] = best_desc or result.get("desc", "")
+    result["raw"] = best_raw or result.get("raw", "")
     result["source_urls"] = source_urls
-    result["source_url"] = _normalize_merge_text(result.get("source_url") or (source_urls[0] if source_urls else ""))
-    result["merge_strategy"] = merge_strategy
+    result["source_url"] = result.get("source_url") or (source_urls[0] if source_urls else "")
     return result
-
-
-def _candidate_signature(candidate: dict) -> tuple:
-    return (
-        _normalize_merge_name(candidate.get("name", "")),
-        _normalize_merge_int(candidate.get("quantity")),
-        _normalize_merge_int(candidate.get("price")),
-        _normalize_merge_text(candidate.get("desc")),
-        _normalize_merge_text(candidate.get("raw")),
-        _normalize_merge_text(candidate.get("status") or "active") or "active",
-    )
-
-
-def _needs_llm_merge(candidates: list[dict]) -> bool:
-    if len(candidates) <= 1:
-        return False
-    return len({_candidate_signature(candidate) for candidate in candidates}) > 1
-
-
-def _validate_llm_merge_result(merged: dict, fallback: dict, candidates: list[dict]) -> dict | None:
-    if not isinstance(merged, dict):
-        return None
-    if set(merged) - ALLOWED_MERGE_FIELDS:
-        return None
-
-    normalized_name = _normalize_merge_name(merged.get("name"))
-    fallback_name = _normalize_merge_name(fallback.get("name"))
-    candidate_names = {_normalize_merge_name(candidate.get("name")) for candidate in candidates}
-    if not normalized_name or normalized_name != fallback_name or normalized_name not in candidate_names:
-        return None
-
-    quantity = _normalize_merge_int(merged.get("quantity"))
-    fallback_quantity = _normalize_merge_int(fallback.get("quantity"))
-    if quantity != fallback_quantity:
-        return None
-
-    price = _normalize_merge_int(merged.get("price"))
-    desc = _normalize_merge_text(merged.get("desc"))
-    raw = _normalize_merge_text(merged.get("raw"))
-    status = _normalize_merge_text(merged.get("status") or "active")
-    source_url = _normalize_merge_text(merged.get("source_url"))
-    source_urls = fallback.get("source_urls", [])
-
-    if status != "active":
-        return None
-    if source_url and source_url not in source_urls:
-        return None
-
-    result = dict(fallback)
-    result["name"] = fallback.get("name", "")
-    result["quantity"] = fallback_quantity
-    result["price"] = price
-    result["desc"] = desc
-    result["raw"] = raw
-    result["status"] = "active"
-    result["source_url"] = source_url or fallback.get("source_url", "")
-    result["source_urls"] = source_urls
-    result["merge_strategy"] = "llm"
-    return result
-
-
-def _merge_item_candidates(slot: dict, candidates: list[dict], llm_config: dict | None = None) -> dict:
-    merge_strategy = "single_source" if len(candidates) == 1 else "fallback"
-    fallback = _fallback_merge_item(candidates, merge_strategy=merge_strategy)
-    if len(candidates) <= 1 or not llm_config or not _needs_llm_merge(candidates):
-        return fallback
-
-    try:
-        merged = _call_merge_llm(slot, candidates, llm_config)
-    except Exception:
-        return _fallback_merge_item(candidates, merge_strategy="fallback")
-
-    validated = _validate_llm_merge_result(merged, _fallback_merge_item(candidates, merge_strategy="fallback"), candidates)
-    if not validated:
-        return _fallback_merge_item(candidates, merge_strategy="fallback")
-    return validated
 
 
 def _llm_headers(llm_config: dict) -> dict[str, str]:
@@ -163,17 +62,6 @@ def _llm_headers(llm_config: dict) -> dict[str, str]:
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
     return headers
-
-
-def _require_llm_config(llm_config: dict | None) -> tuple[str, str]:
-    config = llm_config or {}
-    base_url = (config.get("base_url") or "").rstrip("/")
-    model = (config.get("model") or "").strip()
-    if not base_url:
-        raise LLMParseError("llm.base_url is required for parsing")
-    if not model:
-        raise LLMParseError("llm.model is required for parsing")
-    return base_url, model
 
 
 def _build_merge_prompt(slot: dict, candidates: list[dict]) -> str:
@@ -185,13 +73,13 @@ def _build_merge_prompt(slot: dict, candidates: list[dict]) -> str:
                     "candidate_index": index,
                     "slot_time": slot.get("time", ""),
                     "slot_label": slot.get("label", ""),
-                    "name": _normalize_merge_text(candidate.get("name", "")),
-                    "quantity": _normalize_merge_int(candidate.get("quantity")),
-                    "price": _normalize_merge_int(candidate.get("price")),
-                    "desc": _normalize_merge_text(candidate.get("desc", "")),
-                    "raw": _normalize_merge_text(candidate.get("raw", "")),
-                    "status": "active",
-                    "source_url": _normalize_merge_text(candidate.get("source_url", "")),
+                    "name": candidate.get("name", ""),
+                    "quantity": candidate.get("quantity"),
+                    "price": candidate.get("price"),
+                    "desc": candidate.get("desc", ""),
+                    "raw": candidate.get("raw", ""),
+                    "status": candidate.get("status", "active"),
+                    "source_url": candidate.get("source_url", ""),
                 },
                 ensure_ascii=False,
             )
@@ -200,14 +88,11 @@ def _build_merge_prompt(slot: dict, candidates: list[dict]) -> str:
     return "\n".join(
         [
             "你要把同一时间段、同一商品的多个来源候选记录合并成一条最终记录。",
-            "只能基于给定候选记录作答，不能猜测、补造、改名或改数量。",
-            "只输出一个 JSON object，不能输出 Markdown、解释、代码块或额外字段。",
-            "字段只能是 name、quantity、price、desc、raw、status、source_url。",
-            "name 必须与候选商品名一致；quantity 必须与候选数量一致；status 必须固定为 active。",
-            "source_url 必须直接从候选 source_url 中选择一个。",
-            "price 只能填整数或 null；desc/raw 只能填字符串，可为空字符串。",
-            "如果候选互补，就保留更完整且不冲突的信息；如果冲突，优先更具体、更像原文商品行的值。",
-            '严格输出: {"name": str, "quantity": int|null, "price": int|null, "desc": str, "raw": str, "status": "active", "source_url": str}',
+            "只基于给定结构化字段判断，不要猜测不存在的信息。",
+            "优先保留：明确价格、最完整且不冲突的描述、最可读的原始行。",
+            "如果多个来源互补，就合并；如果冲突，优先更具体、更完整、更像原文商品行的值。",
+            "返回严格 JSON，不要 Markdown，不要解释。",
+            '输出格式: {"name": str, "quantity": int|null, "price": int|null, "desc": str, "raw": str, "status": "active", "source_url": str}',
             "候选记录:",
             *candidate_lines,
         ]
@@ -242,6 +127,33 @@ def _call_merge_llm(slot: dict, candidates: list[dict], llm_config: dict) -> dic
     if not content:
         return None
     return json.loads(content)
+
+
+def _merge_item_candidates(slot: dict, candidates: list[dict], llm_config: dict | None = None) -> dict:
+    fallback = _fallback_merge_item(candidates)
+    if len(candidates) <= 1 or not llm_config:
+        return fallback
+
+    try:
+        merged = _call_merge_llm(slot, candidates, llm_config)
+    except Exception:
+        return fallback
+
+    if not isinstance(merged, dict):
+        return fallback
+
+    result = dict(fallback)
+    for field in ("name", "quantity", "price", "desc", "raw", "status", "source_url"):
+        value = merged.get(field)
+        if value in (None, "") and field in {"desc", "raw"}:
+            continue
+        if value is not None:
+            result[field] = value
+
+    result["status"] = "active"
+    result["source_urls"] = fallback.get("source_urls", [])
+    result["source_url"] = result.get("source_url") or fallback.get("source_url", "")
+    return result
 
 
 def merge_parsed_sources(sources: list[dict], listen: list[str], llm_config: dict | None = None) -> dict:
@@ -422,6 +334,115 @@ def normalize_article_text(article_html: str) -> str:
     return "\n".join(lines)
 
 
+def _normalize_section(line: str) -> tuple[str, str, str] | None:
+    normalized = line.replace("【", "").replace("】", "").replace("（", "(").replace("）", ")")
+    for pattern, section_id, display_name, time_value in SECTION_PATTERNS:
+        if re.search(pattern, normalized, re.I):
+            return section_id, display_name, time_value
+    return None
+
+
+def _parse_item_line(line: str) -> dict | None:
+    text = re.sub(r"^\d+[、.．]\s*", "", line).strip("：: ")
+    if text in {"无", "【无】", "未完待续……", "未完待续", "暂无", "未更新", "未更新商品"}:
+        return {
+            "name": text.replace("【", "").replace("】", ""),
+            "quantity": None,
+            "price": None,
+            "desc": "",
+            "raw": line,
+            "status": "empty" if "无" in text else "pending",
+        }
+
+    price_match = re.search(r"价格\s*(\d+)", text)
+    quantity_match = re.search(r"(.+?)[*＊×xX](\d+)", text)
+
+    name = text
+    quantity = None
+    if quantity_match:
+        name = quantity_match.group(1).strip("｜|｜:：（）() ")
+        quantity = int(quantity_match.group(2))
+    if price_match:
+        name = re.sub(r"[｜|]?[（(]?\s*价格\s*\d+.*?$", "", name).strip("｜|｜:：（）() ")
+
+    if not quantity_match and not price_match:
+        return None
+
+    return {
+        "name": name,
+        "quantity": quantity,
+        "price": int(price_match.group(1)) if price_match else None,
+        "desc": "",
+        "raw": line,
+        "status": "active",
+    }
+
+
+def _parse_slots(normalized_text: str) -> list[dict]:
+    lines = [line.strip() for line in normalized_text.split("\n") if line.strip()]
+    slots: list[dict] = []
+    current: dict | None = None
+
+    for line in lines:
+        section = _normalize_section(line)
+        if section:
+            current = {
+                "id": section[0],
+                "label": section[1],
+                "time": section[2],
+                "items": [],
+                "notes": [],
+                "status": "active",
+            }
+            slots.append(current)
+            continue
+
+        if current is None:
+            continue
+
+        item = _parse_item_line(line)
+        if item:
+            current["items"].append(item)
+            if item["status"] != "active":
+                current["status"] = item["status"]
+            continue
+
+        if current["items"] and any(token in line for token in DESC_TOKENS):
+            current["items"][-1]["desc"] = line
+            continue
+
+        if current["items"] and line.startswith("PS"):
+            break
+
+        if line in {"攻略汇总", "官网网址", "热门推荐"}:
+            break
+
+        current["notes"].append(line)
+
+    return slots
+
+
+def _sort_slots(slots: list[dict]) -> list[dict]:
+    return sorted(slots, key=lambda slot: TIME_ORDER.get(slot.get("time", ""), 99))
+
+
+def _active_slots(slots: list[dict]) -> list[dict]:
+    active_slots: list[dict] = []
+    for slot in _sort_slots(slots):
+        items = [item for item in slot.get("items", []) if item.get("status") == "active"]
+        if not items:
+            continue
+        active_slots.append(
+            {
+                **slot,
+                "items": items,
+                "notes": [],
+                "status": "active",
+            }
+        )
+    return active_slots
+
+
 def _current_time_range(now: datetime | None = None) -> str | None:
     current = now or datetime.now()
     hour = current.hour
@@ -474,196 +495,24 @@ def _strip_comments(value):
     return value
 
 
-def _parse_json_object(content: str) -> dict:
-    try:
-        parsed = json.loads(content)
-    except json.JSONDecodeError as exc:
-        raise LLMParseError(f"LLM returned invalid JSON: {exc}") from exc
-    if not isinstance(parsed, dict):
-        raise LLMParseError("LLM response must be a JSON object")
-    return parsed
-
-
-def _coerce_int(value) -> int | None:
-    if value in (None, ""):
-        return None
-    if isinstance(value, bool):
-        return None
-    if isinstance(value, int):
-        return value
-    if isinstance(value, float):
-        return int(value)
-    match = re.search(r"-?\d+", str(value))
-    return int(match.group()) if match else None
-
-
-def _coerce_str(value) -> str:
-    if value is None:
-        return ""
-    return str(value).strip()
-
-
-def _normalize_item(item: dict, source_url: str) -> dict | None:
-    if not isinstance(item, dict):
-        return None
-
-    name = _coerce_str(item.get("name"))
-    raw = _coerce_str(item.get("raw"))
-    if not name and not raw:
-        return None
-
-    status = _coerce_str(item.get("status")) or "active"
-    if status not in VALID_ITEM_STATUS:
-        status = "active"
-
-    return {
-        "name": name or raw,
-        "quantity": _coerce_int(item.get("quantity")),
-        "price": _coerce_int(item.get("price")),
-        "desc": _coerce_str(item.get("desc")),
-        "raw": raw or name,
-        "status": status,
-        "source_url": _coerce_str(item.get("source_url")) or source_url,
-    }
-
-
-def _normalize_slot(slot: dict, index: int, source_url: str) -> dict | None:
-    if not isinstance(slot, dict):
-        return None
-
-    time_value = _coerce_str(slot.get("time"))
-    label = _coerce_str(slot.get("label")) or time_value or f"slot-{index}"
-    status = _coerce_str(slot.get("status")) or "active"
-    if status not in VALID_SLOT_STATUS:
-        status = "active"
-
-    raw_items = slot.get("items", [])
-    if not isinstance(raw_items, list):
-        return None
-
-    items = []
-    for item in raw_items:
-        normalized_item = _normalize_item(item, source_url)
-        if normalized_item:
-            items.append(normalized_item)
-
-    if not items:
-        return None
-
-    raw_notes = slot.get("notes", [])
-    notes = []
-    if isinstance(raw_notes, list):
-        for note in raw_notes:
-            note_text = _coerce_str(note)
-            if note_text:
-                notes.append(note_text)
-
-    return {
-        "id": _coerce_str(slot.get("id")) or time_value or f"slot-{index}",
-        "label": label,
-        "time": time_value,
-        "items": items,
-        "notes": notes,
-        "status": status,
-    }
-
-
-def _build_parse_prompt(clean_text: str, source_url: str, listen: list[str]) -> str:
-    listen_json = json.dumps([name for name in listen if name], ensure_ascii=False)
-    return "\n".join(
-        [
-            "你会收到某个网页提取并清洗后的正文纯文本。",
-            "请只基于给定正文提取结构化商品信息，不要猜测正文里不存在的信息。",
-            "不要依赖网页标签或 DOM，因为这些已经被清洗掉了。",
-            "目标是识别文章中的售卖时间段和对应商品，并返回严格 JSON。不要 Markdown，不要解释。",
-            "如果正文里没有足够信息，返回空 slots。",
-            "时间字段优先使用这些值：全天、8-12、12-16、16-20、20-24。",
-            "每个 item 输出字段：name, quantity, price, desc, raw, status。",
-            "quantity/price 无法确认时填 null。status 只能是 active、empty、pending 之一。",
-            "输出 JSON 结构示例:",
-            '{"title": "", "published_at": "", "slots": [{"id": "", "label": "", "time": "", "items": [{"name": "", "quantity": null, "price": null, "desc": "", "raw": "", "status": "active"}], "notes": [], "status": "active"}]}',
-            f"当前监听关键词仅供参考，不要求你生成 matches: {listen_json}",
-            f"来源 URL: {source_url}",
-            "正文开始:",
-            clean_text,
-        ]
-    )
-
-
-def _call_parse_llm(clean_text: str, llm_config: dict | None, source_url: str, listen: list[str]) -> dict:
-    config = llm_config or {}
-    base_url, model = _require_llm_config(config)
-    payload = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": "你是一个严格输出 JSON 的网页正文结构化解析器。"},
-            {"role": "user", "content": _build_parse_prompt(clean_text, source_url, listen)},
-        ],
-        "response_format": {"type": "json_object"},
-        "temperature": 0,
-    }
-
-    try:
-        response = requests.post(
-            f"{base_url}/chat/completions",
-            headers=_llm_headers(config),
-            json=payload,
-            timeout=60,
-        )
-        response.raise_for_status()
-        data = response.json()
-        content = data["choices"][0]["message"]["content"]
-    except requests.RequestException as exc:
-        raise LLMParseError(f"LLM request failed: {exc}") from exc
-    except (KeyError, IndexError, TypeError, ValueError) as exc:
-        raise LLMParseError(f"Unexpected LLM response shape: {exc}") from exc
-
-    if not content:
-        raise LLMParseError("LLM returned empty content")
-    return _parse_json_object(content)
-
-
-def _normalize_llm_result(result: dict, normalized_text: str, source_length: int, source_url: str, listen: list[str]) -> dict:
-    raw_slots = result.get("slots", [])
-    if raw_slots is None:
-        raw_slots = []
-    if not isinstance(raw_slots, list):
-        raise LLMParseError("LLM response field 'slots' must be a list")
-
-    slots = []
-    for index, slot in enumerate(raw_slots, start=1):
-        normalized_slot = _normalize_slot(slot, index, source_url)
-        if normalized_slot:
-            slots.append(normalized_slot)
-
-    parsed = {
-        "title": _coerce_str(result.get("title")) or None,
-        "published_at": _coerce_str(result.get("published_at")) or None,
-        "current_time": _current_time_range(),
-        "normalized_text": normalized_text,
-        "slots": sorted(slots, key=lambda slot: TIME_ORDER.get(slot.get("time", ""), 99)),
-        "source_length": source_length,
-        "source_url": source_url,
-    }
-    parsed["matches"] = _build_matches(parsed["slots"], listen)
-    parsed["matched"] = bool(parsed["matches"])
-    return _strip_comments(parsed)
-
-
-def parse_article_content(html: str, parse_config: dict, listen: list[str], llm_config: dict, source_url: str) -> dict:
+def parse_article_content(html: str, parse_config: dict, listen: list[str]) -> dict:
+    title = _extract_title(html)
+    published_at = _extract_published_at(html)
     article_html = _extract_article_html(html, parse_config.get("article_class"))
     normalized_text = normalize_article_text(article_html)
-    if not normalized_text:
-        raise LLMParseError("Article text is empty after cleaning")
+    slots = _parse_slots(normalized_text)
+    matches = _build_matches(slots, listen)
 
-    llm_result = _call_parse_llm(normalized_text, llm_config, source_url, listen)
-    parsed = _normalize_llm_result(llm_result, normalized_text, len(html), source_url, listen)
-
-    if not parsed["title"]:
-        parsed["title"] = _extract_title(html)
-    if not parsed["published_at"]:
-        parsed["published_at"] = _extract_published_at(html)
-    return parsed
+    return _strip_comments({
+        "title": title,
+        "published_at": published_at,
+        "current_time": _current_time_range(),
+        "normalized_text": normalized_text,
+        "slots": _active_slots(slots),
+        "matches": matches,
+        "matched": bool(matches),
+        "source_length": len(html),
+    })
 
 
 def render_markdown(parsed: dict) -> str:
@@ -693,7 +542,7 @@ def render_markdown(parsed: dict) -> str:
 
 def parse_with_llm(html: str, llm_config: dict, products: list[dict]) -> dict:
     listen = [item.get("name", "") for item in products if item.get("name")]
-    return parse_article_content(html, {"article_class": llm_config.get("article_class")}, listen, llm_config, "")
+    return parse_article_content(html, llm_config, listen)
 
 
 def llm_input_from_html(html: str, article_class: str | None = None) -> str:
