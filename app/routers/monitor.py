@@ -67,7 +67,8 @@ def _scan_once() -> dict:
         url = source["url"]
         uid = extract_uid(url)
         if uid:
-            bili_payload = fetch_bili_video_titles(uid)
+            sessdata = (fetch_config.get("bilibili") or {}).get("sessdata")
+            bili_payload = fetch_bili_video_titles(uid, sessdata=sessdata)
             titles = bili_payload.get("titles", [])
             if not titles:
                 logger.warning(
@@ -85,9 +86,13 @@ def _scan_once() -> dict:
                 bili_payload.get("day"),
                 len(titles),
             )
-            content = "\n".join(titles)
-            html = f"<html><body><div class='bili-videos'>{content}</div></body></html>"
-            parse_config = {"article_class": "bili-videos"}
+            results.append({
+                "source_url": url,
+                "videos": bili_payload.get("videos", []),
+                "titles": titles,
+                "triggered": False,
+            })
+            continue
         else:
             html = fetch_html(url, fetch_config.get("headers"))
             parse_config = {"article_class": source.get("class")}
@@ -96,7 +101,13 @@ def _scan_once() -> dict:
         results.append(parsed)
 
     if not results:
-        return _strip_comments({"sources": [], "merged": {}, "triggered": False, "csv_paths": []})
+        return []
+
+    if all(isinstance(item, dict) and "videos" in item for item in results):
+        videos = []
+        for item in results:
+            videos.extend(item.get("videos", []))
+        return videos
 
     merged = merge_parsed_sources(results, listen, llm_config)
     triggered = should_notify(merged, listen)
@@ -131,13 +142,14 @@ def _load_cached_result() -> dict:
     return load_cached_scan(CONFIG.get("listen", []))
 
 
+@router.get("/scan")
 @router.post("/scan")
 def scan(request: Request):
     _log_request(request)
     _log_json("扫描来源配置", CONFIG.get("fetch", {}).get("sources") or CONFIG.get("fetch", {}))
 
     result = _scan_or_raise(request)
-    if result["triggered"] and CONFIG.get("notify", {}).get("enabled"):
+    if isinstance(result, dict) and result["triggered"] and CONFIG.get("notify", {}).get("enabled"):
         message = render_markdown(result["merged"])
         send_openclaw_message(CONFIG["notify"]["command"], message)
 
