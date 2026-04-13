@@ -1,0 +1,43 @@
+{
+  "server": {
+    "_comment": "FastAPI 监听地址和端口。",
+    "host": "0.0.0.0",
+    "port": 8000
+  },
+  "polling": {
+    "_comment": "轮询间隔，单位秒。",
+    "interval_seconds": 60
+  },
+  "llm": {
+    "_comment": "如需接 LLM，传入的将是去掉 HTML 标签后的正文纯文本。",
+    "base_url": "https://api.example.com/v1",
+    "api_key": "replace-me",
+    "model": "gpt-5.4-mini-fast"
+  },
+  "fetch": {
+    "_comment": "目标网页抓取配置。",
+    "sources": [
+      {
+        "url": "https://www.vgover.com/news/209766",
+        "class": "widget-article"
+      },
+      {
+        "url": "https://gl.ali213.net/html/2026-4/1762621.html",
+        "class": "ArticleBody"
+      }
+    ],
+    "headers": {
+      "_comment": "抓取网页时附带的请求头。",
+      "User-Agent": "Mozilla/5.0"
+    }
+  },
+  "listen": [
+    "国王球",
+    "炫彩"
+  ],
+  "notify": {
+    "_comment": "规则命中后执行的通知命令。",
+    "enabled": true,
+    "command": "openclaw message send --channel openclaw-weixin --account 39e******0b7-im-bot --target o9c**********REF-Lsc*****fmk@im.wechat --file \"{{message_file}}\""
+  }
+}
