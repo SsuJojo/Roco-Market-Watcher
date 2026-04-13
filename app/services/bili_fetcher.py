@@ -18,10 +18,12 @@ async def _get_video_list(uid: int) -> list[str]:
     try:
         u = user.User(uid)
         res = await u.get_videos()
+        logger.info(f"Bilibili API response for UID {uid}: {res}")
         # The response structure usually has 'list' containing video info
         # inside 'list' is 'vlist' which is a list of videos
         vlist = res.get("list", {}).get("vlist", [])
         titles = [v.get("title", "") for v in vlist if v.get("title")]
+        logger.info(f"Extracted {len(titles)} titles for UID {uid}")
         return titles
     except Exception as e:
         logger.error(f"Failed to fetch Bilibili videos for UID {uid}: {e}")

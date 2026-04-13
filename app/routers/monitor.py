@@ -68,11 +68,13 @@ def _scan_once() -> dict:
         uid = extract_uid(url)
         if uid:
             titles = fetch_bili_video_titles(uid)
+            if not titles:
+                logger.warning(f"No video titles found for UID {uid}, skipping.")
+                continue
+                
             # Use video titles as the input "content"
             content = "\n".join(titles)
-            # Wrap in simple HTML to reuse parse_article_content's cleaning logic if needed,
-            # or just pass it as is if parse_article_content can handle non-HTML.
-            # Actually, parse_article_content expects HTML, so we wrap it.
+            # Wrap in simple HTML to reuse parse_article_content's cleaning logic
             html = f"<html><body><div class='bili-videos'>{content}</div></body></html>"
             parse_config = {"article_class": "bili-videos"}
         else:
@@ -81,6 +83,9 @@ def _scan_once() -> dict:
             
         parsed = parse_article_content(html, parse_config, listen, llm_config, url)
         results.append(parsed)
+
+    if not results:
+        return _strip_comments({"sources": [], "merged": {}, "triggered": False, "csv_paths": []})
 
     merged = merge_parsed_sources(results, listen, llm_config)
     triggered = should_notify(merged, listen)
