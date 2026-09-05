@@ -29,10 +29,51 @@
 `config.json` 已加入 `.gitignore`，避免把本地敏感配置提交到公共仓库。
 
 ## 安装与启动
+
+需要 Python 3.10+。仓库包含 Bilibili API 子模块，首次检出后先初始化它：
+
+```bash
+git submodule update --init --recursive
+```
+
+复制示例配置后再填入实际网页、模型和通知设置。选择与你的终端对应的一条命令：
+
+```bash
+cp config.example.json config.json
+```
+
+```powershell
+Copy-Item config.example.json config.json
+```
+
+```bat
+copy config.example.json config.json
+```
+
+创建虚拟环境并安装依赖。macOS/Linux：
+
 ```bash
 python -m venv .venv
-source .venv/Scripts/activate
-pip install -r requirements.txt
+source .venv/bin/activate
+python -m pip install -r requirements.txt
+python app.py
+```
+
+Windows PowerShell：
+
+```powershell
+python -m venv .venv
+.venv\Scripts\Activate.ps1
+python -m pip install -r requirements.txt
+python app.py
+```
+
+Windows 命令提示符（cmd）：
+
+```bat
+python -m venv .venv
+.venv\Scripts\activate.bat
+python -m pip install -r requirements.txt
 python app.py
 ```
 
@@ -54,6 +95,17 @@ curl -X POST http://127.0.0.1:8000/api/scan
 - `config.example.json`：示例配置
 - `config.json`：本地运行配置（已忽略）
 - `data/`：运行产生的数据目录（已忽略）
+- `tmp_inspect_bili_raw.py`：可选的 Bilibili 原始响应诊断脚本
+
+## 可选调试工具
+
+`tmp_inspect_bili_raw.py` 是保留在仓库根目录的独立诊断脚本，不会被服务自动调用，也不会读取或修改 `config.json`、`data/`。初始化子模块后，可在仓库根目录运行：
+
+```bash
+python tmp_inspect_bili_raw.py
+```
+
+它会查询脚本中固定的 Bilibili 用户并打印响应片段；如需诊断其他账号，请在本地临时修改脚本中的 UID，不要把个人凭据写入仓库。
 
 ## 说明
 当前仓库默认暴露的是手动扫描接口，通知会复用已配置好的 OpenClaw channel。
